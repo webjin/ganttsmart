@@ -1,5 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { addBusinessDays, format, isWeekend } from "npm:date-fns@4.1.0";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -140,14 +141,14 @@ async function fetchLinearData(apiKey: string, projectId: string) {
       targetDate
       issues(first: 250, filter: { completedAt: { null: true } }) {
         nodes {
-          id identifier title description dueDate priority url completedAt
+          id identifier title description dueDate estimate priority url completedAt
           state { name type }
           assignee { name }
         }
       }
       doneIssues: issues(first: 100, filter: { completedAt: { null: false } }) {
         nodes {
-          id identifier title description dueDate priority url completedAt
+          id identifier title description dueDate estimate priority url completedAt
           state { name type }
           assignee { name }
         }
@@ -168,22 +169,33 @@ async function fetchLinearData(apiKey: string, projectId: string) {
   const project = result.data?.project;
   if (!project) throw new Error("Project not found");
 
-  // Effective due: explicit dueDate, falling back to project target date (parity with main app).
+  // Effective due: explicit dueDate, estimated working days, then project target date.
   const projectTargetDate: string | null = project.targetDate || null;
-  function effectiveDue(n: any): { date: string; isImplicit: boolean } | null {
+  function effectiveDue(n: any): { date: string; isImplicit: boolean; startDate?: string } | null {
     if (n.dueDate) return { date: n.dueDate, isImplicit: false };
+    if (n.estimate != null && n.estimate > 0) {
+      const startDate = parseStartDate(n.description);
+      let start = startDate ? new Date(startDate + "T00:00:00") : new Date();
+      if (isWeekend(start)) start = addBusinessDays(start, 1);
+      return {
+        // The first working day counts as day one, matching the chart's inclusive bars.
+        date: format(addBusinessDays(start, Math.ceil(n.estimate) - 1), "yyyy-MM-dd"),
+        isImplicit: false,
+        startDate: startDate || format(start, "yyyy-MM-dd"),
+      };
+    }
     if (projectTargetDate) return { date: projectTargetDate, isImplicit: true };
     return null;
   }
 
-  function mapNode(n: any, due: string, isDueImplicit: boolean) {
+  function mapNode(n: any, due: string, isDueImplicit: boolean, startDate = parseStartDate(n.description)) {
     return {
       id: n.identifier,
       uuid: n.id,
       title: n.title,
       description: n.description || "",
       due,
-      startDate: parseStartDate(n.description),
+      startDate,
       priorityVal: n.priority,
       priority: PRIORITY_MAP[n.priority] || "None",
       status: n.state?.name || "",
@@ -207,7 +219,7 @@ async function fetchLinearData(apiKey: string, projectId: string) {
   for (const n of project.issues.nodes) {
     const eff = effectiveDue(n);
     if (eff) {
-      tasks.push(mapNode(n, eff.date, eff.isImplicit));
+      tasks.push(mapNode(n, eff.date, eff.isImplicit, eff.startDate));
     } else {
       // Placeholder due so consumers that need `due` can render. Marked implicit.
       const today = new Date();
@@ -221,7 +233,7 @@ async function fetchLinearData(apiKey: string, projectId: string) {
   const doneTasks = (project.doneIssues?.nodes || [])
     .map((n: any) => {
       const eff = effectiveDue(n);
-      return eff ? mapNode(n, eff.date, eff.isImplicit) : null;
+      return eff ? mapNode(n, eff.date, eff.isImplicit, eff.startDate) : null;
     })
     .filter((t: any) => t !== null)
     .sort((a: any, b: any) => {

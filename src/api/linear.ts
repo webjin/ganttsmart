@@ -1,4 +1,5 @@
 import { PRIORITY_MAP, type Milestone, type Project, type Task, type WorkflowState } from '@/types';
+import { addBusinessDays, format, isWeekend } from 'date-fns';
 
 const LINEAR_API = 'https://api.linear.app/graphql';
 
@@ -190,6 +191,7 @@ export async function fetchIssues(
             title
             description
             dueDate
+            estimate
             url
             priority
             state { name type }
@@ -207,6 +209,7 @@ export async function fetchIssues(
             title
             description
             dueDate
+            estimate
             url
             priority
             state { name type }
@@ -228,6 +231,7 @@ export async function fetchIssues(
     title: string;
     description: string | null;
     dueDate: string | null;
+    estimate: number | null;
     url: string;
     priority: number;
     state: { name: string; type: string } | null;
@@ -263,10 +267,21 @@ export async function fetchIssues(
   const doneIssueNodes = project.doneIssues?.nodes || [];
   const projectTargetDate = project.targetDate;
 
-  // Effective due date: explicit dueDate, falling back to project's targetDate.
+  // Effective due date: explicit dueDate, estimated working days, then project's targetDate.
   // Returns { date, isImplicit } or null if no date can be derived at all.
-  function effectiveDue(n: IssueNode): { date: string; isImplicit: boolean } | null {
+  function effectiveDue(n: IssueNode): { date: string; isImplicit: boolean; startDate?: string } | null {
     if (n.dueDate) return { date: n.dueDate, isImplicit: false };
+    if (n.estimate != null && n.estimate > 0) {
+      const startDate = parseStartDate(n.description || '');
+      let start = startDate ? new Date(startDate + 'T00:00:00') : new Date();
+      if (isWeekend(start)) start = addBusinessDays(start, 1);
+      return {
+        // The first working day counts as day one, matching the chart's inclusive bars.
+        date: format(addBusinessDays(start, Math.ceil(n.estimate) - 1), 'yyyy-MM-dd'),
+        isImplicit: false,
+        startDate: startDate || format(start, 'yyyy-MM-dd'),
+      };
+    }
     if (projectTargetDate) return { date: projectTargetDate, isImplicit: true };
     return null;
   }
@@ -345,7 +360,7 @@ export async function fetchIssues(
     }
   }
 
-  function mapNode(n: IssueNode, due: string, isDueImplicit: boolean): Task {
+  function mapNode(n: IssueNode, due: string, isDueImplicit: boolean, startDate = parseStartDate(n.description || '')): Task {
     const rel = relationsMap[n.identifier] || { blocks: [], blockedBy: [] };
     const ch = childrenMap[n.identifier] || { total: 0, completed: 0 };
     const progress = ch.total > 0 ? Math.round((ch.completed / ch.total) * 100) : 0;
@@ -356,7 +371,7 @@ export async function fetchIssues(
       title: n.title,
       description: n.description || '',
       due,
-      startDate: parseStartDate(n.description || ''),
+      startDate,
       url: n.url,
       priorityVal: n.priority,
       priority: PRIORITY_MAP[n.priority] || 'None',
@@ -381,7 +396,7 @@ export async function fetchIssues(
   for (const n of issueNodes) {
     const eff = effectiveDue(n);
     if (eff) {
-      tasks.push(mapNode(n, eff.date, eff.isImplicit));
+      tasks.push(mapNode(n, eff.date, eff.isImplicit, eff.startDate));
     } else {
       // No date — show as unscheduled with a placeholder due date (today) so consumers
       // that need `due` can render. UI treats these specially via isDueImplicit.
@@ -398,10 +413,9 @@ export async function fetchIssues(
   );
 
   const doneTasks: Task[] = doneIssueNodes
-    .filter((n) => n.dueDate || projectTargetDate)
-    .map((n) => {
-      const eff = effectiveDue(n)!;
-      return mapNode(n, eff.date, eff.isImplicit);
+    .flatMap((n) => {
+      const eff = effectiveDue(n);
+      return eff ? [mapNode(n, eff.date, eff.isImplicit, eff.startDate)] : [];
     })
     .sort((a, b) => {
       const aTime = a.completedAt ? new Date(a.completedAt).getTime() : 0;
